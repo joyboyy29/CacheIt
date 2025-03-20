@@ -7,8 +7,6 @@
 #include <mutex>
 #include <stdexcept>
 
-using u64 = uint64_t;
-
 // if a categorizer fn is provided we group entities by that category
 // if not, we us the default ctor which uses ID based caching
 template <typename T, typename Category = int>
