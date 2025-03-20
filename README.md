@@ -25,6 +25,9 @@
 ## Installation
 - Self explanatory lol
 
+## Requirements
+- C++17 or later
+
 ## ID Mode 
 - If you don't need category-based grouping, use the default constructor.
 - In this mode, CacheIt expects your entity type to have an id member (int)
