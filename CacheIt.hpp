@@ -25,161 +25,248 @@
 #pragma once
 
 #include <vector>
-#include <unordered_map>
 #include <functional>
 #include <shared_mutex>
 #include <mutex>
 #include <stdexcept>
+#include <algorithm>
+#include <cstdint>
+#include <unordered_map>
+#include <type_traits>
+#include <utility>
 
-// if a categorizer fn is provided we group entities by that category
-// if not, we us the default ctor which uses ID based caching
-template <typename T, typename Category = int>
+// ID mode uses a dense table and has add/remove option (didn't add remove_if and add_if as you can just do that by looping and using add or remove)
+// Grouping mode uses a vector of buckets (changed from umap to remove hash overhead)
+
+template<typename T, typename Category = int, typename Categorizer = void>
 class CacheIt {
 public:
-    using categorizer_fn = std::function<Category(const T*)>;
+    using u64 = uint64_t;
+    static constexpr bool grouping_enabled = !std::is_same_v<Categorizer, void>;
 
-    // default ctor that uses ID based cache
-    CacheIt() : enable_grouping_(false) {}
+    // id mode ctor
+    CacheIt() {
+        static_assert(!grouping_enabled, "Default constructor only valid for ID mode");
+    }
 
-    // ctor with categorizer (grouping)
-    explicit CacheIt(categorizer_fn categorizer)
-        : categorizer_(std::move(categorizer)), enable_grouping_(true) {}
+    // grouping-mode ctor (only if Categorizer is not void)
+    template<typename U = Categorizer,
+             typename = std::enable_if_t<!std::is_same_v<U, void>>>
+    explicit CacheIt(U categorizer)
+        : categorizer_(std::move(categorizer)) {}
 
-    // update cache (either ID or grouping)
+    // full rebuild
     void update(const std::vector<T*>& entities) {
-        if (enable_grouping_) {
-            // grouping mode: we build an umap keyed by the category
-            std::unordered_map<Category, std::vector<T*>> local_cache;
-            for (auto* entity : entities) {
-                Category cat = categorizer_(entity);
-                local_cache[cat].push_back(entity);
+        if constexpr (grouping_enabled) {
+            // grouping mode:
+            // changed from umap to vector of buckets
+            std::unordered_map<Category, size_t> local_index;
+            std::vector<Category> local_categories;
+            local_index.reserve(entities.size());
+
+            for (auto* e : entities) {
+                Category c = categorizer_(e);
+                if (!local_index.count(c)) {
+                    local_index[c] = local_categories.size();
+                    local_categories.push_back(c);
+                }
             }
-            {
-                std::unique_lock lock(mutex_);
-                cache_ = std::move(local_cache);
+
+            std::vector<std::vector<T*>> local_buckets(local_categories.size());
+            size_t avg = local_categories.empty() ? 0 : entities.size() / local_categories.size();
+            for (auto& b : local_buckets) b.reserve(avg);
+
+            for (auto* e : entities) {
+                size_t idx = local_index[categorizer_(e)];
+                local_buckets[idx].push_back(e);
             }
+
+            std::unique_lock lock(grouping_mutex_);
+            category_to_index_.swap(local_index);
+            categories_.swap(local_categories);
+            buckets_.swap(local_buckets);
         } else {
-            /* ID mode: we build a dense table indexed with entity->id
-             * a struct of AActor or whatever struct user of the class uses
-             * should have an ID member
-             */
+            // ID mode:
             std::vector<T*> local_table;
-            std::vector<u64> local_active_ids;
-            // in the table, the idx = entity->id;
-            for (auto* entity : entities) {
-                u64 id = entity->id;
-                if (id >= static_cast<u64>(local_table.size()))
+            std::vector<u64> local_ids;
+            std::unordered_map<u64, size_t> local_idx_map;
+            local_table.reserve(entities.size());
+            local_ids.reserve(entities.size());
+            local_idx_map.reserve(entities.size());
+
+            for (auto* e : entities) {
+                u64 id = static_cast<u64>(e->id);
+                if (id >= local_table.size())
                     local_table.resize(id + 1, nullptr);
-                local_table[id] = entity;
-                local_active_ids.push_back(id);
+                local_table[id] = e;
+                size_t pos = local_ids.size();
+                local_ids.push_back(id);
+                local_idx_map[id] = pos;
             }
-            {
-                std::unique_lock lock(mutex_);
-                table_.swap(local_table);
-                active_ids_.swap(local_active_ids);
-            }
-        }
-    }
-    
-    //iterate over a certain category
-    // only usable in grouping mode
-    template <typename Fn>
-    void for_each(const Category& cat, Fn func) const {
-        if (!enable_grouping_) {
-            throw std::runtime_error("oopsie! for_each called in ID mode");
-        }
-        std::vector<T*> local_entities;
-        {
-            std::shared_lock lock(mutex_);
-            if (auto it = cache_.find(cat); it != cache_.end()) {
-                local_entities = it->second;
-            }
-        }
-        for (auto* entity : local_entities) {
-            func(entity);
+
+            std::unique_lock lock(id_mutex_);
+            table_.swap(local_table);
+            active_ids_.swap(local_ids);
+            id_to_index_.swap(local_idx_map);
         }
     }
 
-    // iterate over all entities
-    template <typename Fn>
-    void for_each_all(Fn func) const {
-        if (enable_grouping_) {
-            // grouping: iterate over each group.
-            std::unordered_map<Category, std::vector<T*>> local_cache;
-            {
-                std::shared_lock lock(mutex_);
-                local_cache = cache_;
+    /*
+    * You can use add and remove by doing something like
+        diff_snapshots(prev_actors, curr_actors, to_add, to_remove); // sorts + set_difference
+        for (auto* e : to_add)    cache.add(e);
+        for (auto* e : to_remove) cache.remove(e);
+        prev_actors.swap(curr_actors);
+        curr_actors.clear();
+    */
+
+    // O(1) add
+    void add(T* e) {
+        u64 id = static_cast<u64>(e->id);
+        if constexpr (grouping_enabled) {
+            Category c = categorizer_(e);
+            std::unique_lock lock(grouping_mutex_);
+            auto it = category_to_index_.find(c);
+            if (it == category_to_index_.end()) {
+                size_t idx = categories_.size();
+                category_to_index_[c] = idx;
+                categories_.push_back(c);
+                buckets_.emplace_back();
             }
-            for (const auto& pair : local_cache) {
-                for (auto* entity : pair.second)
-                    func(entity);
+            buckets_[category_to_index_[c]].push_back(e);
+        } else {
+            std::unique_lock lock(id_mutex_);
+            if (id_to_index_.count(id)) return; // avoid duplicates
+            if (id >= table_.size())
+                table_.resize(id + 1, nullptr);
+            table_[id] = e;
+            size_t pos = active_ids_.size();
+            active_ids_.push_back(id);
+            id_to_index_[id] = pos;
+        }
+    }
+
+    // O(1) remove
+    void remove(T* e) {
+        u64 id = static_cast<u64>(e->id);
+        if constexpr (grouping_enabled) {
+            Category c = categorizer_(e);
+            std::unique_lock lock(grouping_mutex_);
+            auto it = category_to_index_.find(c);
+            if (it == category_to_index_.end()) return;
+            auto& vec = buckets_[it->second];
+            if (auto pos = std::find(vec.begin(), vec.end(), e); pos != vec.end()) {
+                std::iter_swap(pos, vec.end() - 1);
+                vec.pop_back();
             }
         } else {
-            // ID: iterate over the table
-            std::vector<T*> local_table;
-            {
-                std::shared_lock lock(mutex_);
-                local_table = table_;
-            }
-            for (auto* entity : local_table) {
-                if (entity)
-                    func(entity);
-            }
+            std::unique_lock lock(id_mutex_);
+            auto it = id_to_index_.find(id);
+            if (it == id_to_index_.end()) return;
+            size_t idx = it->second;
+            size_t last = active_ids_.size() - 1;
+            u64 back_id = active_ids_[last];
+            std::swap(active_ids_[idx], active_ids_[last]);
+            active_ids_.pop_back();
+            id_to_index_[back_id] = idx;
+            id_to_index_.erase(it);
+            if (id < table_.size()) table_[id] = nullptr;
         }
     }
 
-    // grouping mode: return copy of the cache
-    std::unordered_map<Category, std::vector<T*>> get_cache() const {
-        if (!enable_grouping_) {
-            throw std::runtime_error("oopsie! get_cache() called in ID mode");
+    void clear() {
+        if constexpr (grouping_enabled) {
+            std::unique_lock lock(grouping_mutex_);
+            category_to_index_.clear();
+            categories_.clear();
+            buckets_.clear();
+        } else {
+            std::unique_lock lock(id_mutex_);
+            table_.clear();
+            active_ids_.clear();
+            id_to_index_.clear();
         }
-        std::unordered_map<Category, std::vector<T*>> local_cache;
-        {
-            std::shared_lock lock(mutex_);
-            local_cache = cache_;
-        }
-        return local_cache;
     }
 
-    // return number of currently cached entities
     size_t size() const {
-        if (enable_grouping_) {
+        if constexpr (grouping_enabled) {
+            std::shared_lock lock(grouping_mutex_);
             size_t total = 0;
-            std::unordered_map<Category, std::vector<T*>> local_cache;
-            {
-                std::shared_lock lock(mutex_);
-                local_cache = cache_;
-            }
-            for (const auto& pair : local_cache)
-                total += pair.second.size();
+            for (auto const& b : buckets_) total += b.size();
             return total;
         } else {
-            size_t count = 0;
-            std::vector<T*> local_table;
-            {
-                std::shared_lock lock(mutex_);
-                local_table = table_;
-            }
-            for (auto* entity : local_table)
-                if (entity)
-                    count++;
-            return count;
+            std::shared_lock lock(id_mutex_);
+            return active_ids_.size();
         }
+    }
+
+    std::vector<T*> get_all() const {
+        std::vector<T*> result;
+        if constexpr (grouping_enabled) {
+            std::shared_lock lock(grouping_mutex_);
+            size_t total = 0;
+            for (auto const& b : buckets_) total += b.size();
+            result.reserve(total);
+            for (auto const& b : buckets_)
+                for (auto* e : b)
+                    result.push_back(e);
+        } else {
+            std::shared_lock lock(id_mutex_);
+            result.reserve(active_ids_.size());
+            for (auto id : active_ids_)
+                if (id < table_.size() && table_[id])
+                    result.push_back(table_[id]);
+        }
+        return result;
+    }
+
+    // iterate single category (grouping only)
+    template<typename Fn>
+    void for_each(const Category& cat, Fn func) const {
+        static_assert(grouping_enabled, "for_each only in grouping mode");
+        std::vector<T*> local;
+        {
+            std::shared_lock lock(grouping_mutex_);
+            auto it = category_to_index_.find(cat);
+            if (it != category_to_index_.end())
+                local = buckets_[it->second];
+        }
+        for (auto* e : local) func(e);
+    }
+
+    // iterate all
+    template<typename Fn>
+    void for_each_all(Fn func) const {
+        if constexpr (grouping_enabled) {
+            std::shared_lock lock(grouping_mutex_);
+            for (auto const& b : buckets_)
+                for (auto* e : b) func(e);
+        } else {
+            std::shared_lock lock(id_mutex_);
+            for (auto* e : table_) if (e) func(e);
+        }
+    }
+
+    // access active ids (ID mode only)
+    const std::vector<u64>& active_ids() const {
+        static_assert(!grouping_enabled, "active_ids only in ID mode");
+        std::shared_lock lock(id_mutex_);
+        return active_ids_;
     }
 
 private:
-    using u64 = uint64_t;
+    // functor
+    std::conditional_t<std::is_same_v<Categorizer, void>, char, Categorizer> categorizer_;
     
-    mutable std::shared_mutex mutex_;
-
-    // used in grouping mode
-    std::unordered_map<Category, std::vector<T*>> cache_;
-
-    // used in ID mode
+    // grouping
+    mutable std::shared_mutex grouping_mutex_;
+    std::unordered_map<Category, size_t> category_to_index_;
+    std::vector<Category> categories_;
+    std::vector<std::vector<T*>> buckets_;
+    
+    // ID
+    mutable std::shared_mutex id_mutex_;
     std::vector<T*> table_;
     std::vector<u64> active_ids_;
-
-    // mode flags
-    bool enable_grouping_;
-    categorizer_fn categorizer_;
+    std::unordered_map<u64, size_t> id_to_index_;
 };
