@@ -81,6 +81,96 @@ grouped_cache.for_each_all([](AActor* actor) {
 size_t total = cache.size();
 ```
 
+## Example:
+```cpp
+#include "CacheIt.hpp"
+#include <iostream>
+#include <vector>
+#include <string>
+
+struct AActor {
+    int id;               // Unique actor ID.
+    float ActorHealth;
+    std::string ActorType;
+};
+
+int main() {
+    AActor a1{0, 55.0f, "Player"};
+    AActor a2{1,  72.0f, "Enemy"};
+    AActor a3{2,  95.0f, "NPC"};
+    std::vector<AActor*> actors = { &a1, &a2, &a3 };
+
+    // id mode
+    CacheIt<AActor> id_cache;
+    id_cache.update(actors);
+
+    // iterate all
+    id_cache.for_each_all([](AActor* actor) {
+        std::cout << "ID Mode Actor " << actor->id << " of type "
+                  << actor->ActorType << "\n";
+    });
+
+    AActor a4{3, 70.0f, "Player"};
+    id_cache.add(&a4);
+
+    id_cache.remove(&a2);
+
+    // access active ids
+    const auto& ids = id_cache.active_ids();
+    std::cout << "Active IDs:";
+    for (auto i : ids)
+        std::cout << ' ' << i;
+    std::cout << '\n';
+
+    // clear all
+    id_cache.clear();
+
+    // grouping mode:
+    auto type_cat = [](const AActor* actor) { return actor->ActorType; };
+    CacheIt<AActor, std::string, decltype(type_cat)> grp_cache(type_cat);
+    grp_cache.update(actors);             // full rebuild
+
+    // specific adds
+    grp_cache.add(&a4);
+    grp_cache.remove(&a3);
+    
+    // iterate players only
+    grp_cache.for_each("Player", [](AActor* actor) {
+        std::cout << "Grouping Mode - Player " << actor->id << "\n";
+    });
+
+    // iterate all
+    grp_cache.for_each_all([](AActor* actor) {
+        std::cout << "Grouping Mode - All " << actor->id << "\n";
+    });
+    
+    std::cout << "Size: " << grp_cache.size() << std::endl;
+    
+    for(auto a : grp_cache.get_all()) {
+        std::cout << "Type: " << a->ActorType << std::endl;
+    }
+
+    grp_cache.clear();
+
+}
+```
+- Output:
+```
+ID Mode Actor 0 of type Player
+ID Mode Actor 1 of type Enemy
+ID Mode Actor 2 of type NPC
+Active IDs: 0 3 2
+Grouping Mode - Player 0
+Grouping Mode - Player 3
+Grouping Mode - All 0
+Grouping Mode - All 3
+Grouping Mode - All 1
+Size: 3
+Type: Player
+Type: Player
+Type: Enemy
+```
+
 ## License
 - This project is licensed under the MIT License.
 
